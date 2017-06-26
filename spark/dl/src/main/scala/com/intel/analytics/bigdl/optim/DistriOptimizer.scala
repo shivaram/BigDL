@@ -30,7 +30,7 @@ import java.util.Calendar
 import org.apache.commons.lang.exception.ExceptionUtils
 import com.intel.analytics.bigdl.visualization.{TrainSummary, ValidationSummary}
 import org.apache.log4j.Logger
-import org.apache.spark.{SparkEnv, TaskContext}
+import org.apache.spark.{SparkEnv, TaskContext, HashPartitioner}
 import org.apache.spark.rdd.{RDD, ZippedPartitionsWithLocalityRDD, CoalescedWithLocalityRDD}
 
 import scala.collection.mutable
@@ -62,6 +62,142 @@ object DistriOptimizer {
     var moduleTimeList: Array[Long] = null,
     localMethods: Array[Option[Array[ValidationMethod[T]]]]
   )
+
+  /**
+   * Execute training on a Spark executor. Internal method used in optimize
+   */
+  def runTrainingOnExecutor[T: ClassTag](
+      data: Iterator[MiniBatch[T]],
+      modelIter: Iterator[Cache[T]],
+      driverMetrics: Metrics,
+      _subModelNumber: Int,
+      dropPercentage: Double,
+      iteration: Int,
+      warmupIterationNum: Int,
+      computeThresholdbatchSize: Int,
+      ev: TensorNumeric[T],
+      threshold: Long): Iterator[(Int, Double, Int)] = {
+    var recordsNum = 0
+    var lossSum = 0.0
+
+    val start = System.nanoTime()
+    val cached = modelIter.next()
+    val executorId = SparkEnv.get.executorId
+    val parameters = ParameterManager2.get(executorId)
+    val syWStart = System.nanoTime()
+    ParameterManager2.synchronized {
+      if (!parameters.job1Start) {
+        parameters.syncWeights(cached.modelWeights.head)
+        parameters.job1Start = true
+      }
+    }
+    val weightSyncTime = System.nanoTime() - syWStart
+    driverMetrics.add("get weights average", weightSyncTime)
+
+    val tensorBuffer = new Array[(Tensor[T], Tensor[T])](_subModelNumber)
+    var tasks: ArrayBuffer[Future[_]] = new ArrayBuffer()
+
+    tasks += Engine.default.invoke(() => {
+      val batch = data.next()
+      var b = 0
+      require(batch.data.size(1) == batch.labels.size(1),
+        "data and label batch size not match")
+      require((batch.data.size(1) >= _subModelNumber) &&
+        (batch.data.size(1) % _subModelNumber == 0), "total batch size: " +
+        s"${batch.data.size(1)} should be divided by total core number: ${_subModelNumber}")
+      if (batch.data.size(1) < _subModelNumber * 2) {
+        logger.warn("Warning: for better training speed, " +
+          "total batch size is recommended to be at least two times of core number" +
+            s"${_subModelNumber}, please tune your batch size accordingly")
+      }
+      val stackSize = batch.data.size(1) / _subModelNumber
+      while (b < _subModelNumber) {
+        tensorBuffer(b) = (batch.data.narrow(1, b * stackSize + 1, stackSize),
+          batch.labels.narrow(1, b * stackSize + 1, stackSize))
+        b += 1
+      }
+    })
+    Engine.default.sync(tasks)
+    tasks.clear()
+
+    var timeout = Long.MaxValue
+
+    // ======================Start train models===================================
+    var time = System.nanoTime()
+    if(dropPercentage > 0 && iteration > warmupIterationNum + computeThresholdbatchSize - 1) {
+      timeout = threshold - weightSyncTime
+    }
+    var lossArray = new Array[Double](_subModelNumber)
+    val pre = (iteration % computeThresholdbatchSize) * _subModelNumber
+    val trainingThreads = Engine.default.invokeAndWait2((0 until _subModelNumber).map(i =>
+      () => {
+        val trainStart = System.nanoTime()
+        val localModel = cached.localModels(i)
+        localModel.training()
+        val localCriterion = cached.localCriterions(i)
+        val (input, target) = tensorBuffer(i)
+        val output = localModel.forward(input)
+        lossArray(i) = ev.toType[Double](localCriterion.forward(output, target))
+        val errors = localCriterion.backward(output, target)
+        localModel.backward(input, errors)
+        cached.moduleTimeList(i + pre) = System.nanoTime() - trainStart + weightSyncTime
+        i
+      }
+    ), timeout)
+    val computingTime = System.nanoTime() - time
+    driverMetrics.add("computing time average", computingTime)
+
+    time = System.nanoTime()
+    val finishedThreads = trainingThreads.filter(!_.isCancelled).map(_.get())
+    recordsNum += finishedThreads.size * tensorBuffer.head._2.size(1)
+    var i = 0
+
+    while (i < finishedThreads.size) {
+      lossSum += lossArray(finishedThreads(i))
+      i += 1
+    }
+
+    if (finishedThreads.size > 0) {
+      time = System.nanoTime()
+      val gradLength = cached.modelGradients(0).nElement()
+      val taskSize = gradLength / _subModelNumber
+      val extraTask = gradLength % _subModelNumber
+
+      (0 until _subModelNumber).diff(finishedThreads).foreach(i =>
+        cached.modelGradients(i).zero()
+      )
+
+      // copy multi-model gradient to the buffer
+      val parallelNum = if (taskSize == 0) extraTask else _subModelNumber
+      Engine.default.invokeAndWait((0 until parallelNum).map(tid => () => {
+        val offset = tid * taskSize + math.min(tid, extraTask)
+        val length = taskSize + (if (tid < extraTask) 1 else 0)
+        var i = 0
+        while (i < cached.modelGradients.length) {
+          if (i == 0) {
+            cached.gradient.narrow(1, offset + 1, length)
+              .copy(cached.modelGradients(i).narrow(1, offset + 1, length))
+          } else {
+            cached.gradient.narrow(1, offset + 1, length)
+              .add(cached.modelGradients(i).narrow(1, offset + 1, length))
+          }
+          i += 1
+        }
+      }))
+    }
+
+    tasks ++= Engine.default.invoke((0 until _subModelNumber).map(i => () => {
+      cached.localModels(i).training()
+      cached.localModels(i).zeroGradParameters()
+    }))
+    driverMetrics.add("aggregate gradient time", System.nanoTime() - time)
+
+    time = System.nanoTime()
+    parameters.sendGradientPartition(cached.gradient, TaskContext.getPartitionId())
+    driverMetrics.add("send gradient partition", System.nanoTime() - time)
+
+    Iterator.single( (finishedThreads.size, lossSum, recordsNum) )
+  }
 
   /**
    * Train the model.
@@ -119,27 +255,31 @@ object DistriOptimizer {
 
     var tasks: ArrayBuffer[Future[_]] = new ArrayBuffer()
     var threshold = Long.MaxValue
-    var timeout = Long.MaxValue
     var iteration = 0
     val dropPercentage = state.get[Double]("dropPercentage").get
     val warmupIterationNum = state.get[Int]("warmupIterationNum").get
     val computeThresholdbatchSize = state.get[Int]("computeThresholdbatchSize").get
+    val drizzleGroupSize = state.get[Int]("drizzleGroupSize").getOrElse(1)
     val maxDropPercentage = state.get[Double]("maxDropPercentage").get
     val driverSubModelNum = partitionNum * _subModelNumber
     var dropModelNumBatch = 0
 
     var epochStart = System.nanoTime()
     var dataRDD = dataset.data(train = true)
+    val dummyPartitioner = new HashPartitioner(Engine.nodeNumber())
+    // This creates an RDD with nodeNumber partitions and
+    // partitions them using the above partitioner
     val dummyRDD = CoalescedWithLocalityRDD(models, Engine.nodeNumber())
-      .mapPartitions { iter =>
-        Iterator(1)
-      }.cache()
+      .mapPartitionsWithIndex { case (idx, iter) =>
+        Iterator.single( (idx, 1) )
+      }.partitionBy(dummyPartitioner).cache()
     dummyRDD.count()
-    
+
     while (!endWhen(driverState)) {
       val _header = header(driverState[Int]("epoch"), accumulateCount, dataset.size(),
         driverState[Int]("neval"), wallClockTime)
-      var lossArray = new Array[Double](_subModelNumber)
+
+      // All of these are accumulators
       val lossSum = sc.accumulator(0.0, "loss sum")
       val recordsNum = sc.accumulator(0, "record number")
       metrics.set("computing time average", 0.0, sc, partitionNum)
@@ -155,189 +295,106 @@ object DistriOptimizer {
       val driverMetrics = metrics
       val start = System.nanoTime()
 
-      val finishedModelNum = dataRDD.zipPartitions(
-        models, true)(
-        (data, modelIter) => {
-          val start = System.nanoTime()
-          val cached = modelIter.next()
+      // Build up the drizzle RDDs
+      val drizzleRDDs = (0 until drizzleGroupSize).map { dIter =>
+        val curIter = iteration + dIter
+        val finishedModels = dataRDD.zipPartitions(models, true)((data, modelIter) => {
+            runTrainingOnExecutor(data, modelIter, driverMetrics, _subModelNumber, dropPercentage,
+              curIter, warmupIterationNum, computeThresholdbatchSize, ev, threshold)
+          }).flatMap { out =>
+            // Emit one key per partition of dummyRDD
+            (0 until Engine.nodeNumber()).map { p =>
+              (p, out)
+            }
+          }.groupByKey(dummyPartitioner).values
+
+        val putGradients = finishedModels.mapPartitions { iter =>
           val executorId = SparkEnv.get.executorId
           val parameters = ParameterManager2.get(executorId)
-          val syWStart = System.nanoTime()
-          ParameterManager2.synchronized {
-            if (!parameters.job1Start) {
-              parameters.syncWeights(cached.modelWeights.head)
-              parameters.job1Start = true
-            }
-          }
-          val weightSyncTime = System.nanoTime() - syWStart
-          driverMetrics.add("get weights average", weightSyncTime)
+          var t = System.nanoTime()
+          val gradient = parameters.aggregateLocalGradient()
+          driverMetrics.add("aggregate local gradient", System.nanoTime() - t)
 
-          val tensorBuffer = new Array[(Tensor[T], Tensor[T])](_subModelNumber)
-          tasks += Engine.default.invoke(() => {
-            val batch = data.next()
-            var b = 0
-            require(batch.data.size(1) == batch.labels.size(1),
-              "data and label batch size not match")
-            require((batch.data.size(1) >= _subModelNumber) &&
-              (batch.data.size(1) % _subModelNumber == 0), "total batch size: " +
-              s"${batch.data.size(1)} should be divided by total core number: ${_subModelNumber}")
-            if (batch.data.size(1) < _subModelNumber * 2) {
-              logger.warn("Warning: for better training speed, " +
-                "total batch size is recommended to be at least two times of core number" +
-                  s"${_subModelNumber}, please tune your batch size accordingly")
-            }
-            val stackSize = batch.data.size(1) / _subModelNumber
-            while (b < _subModelNumber) {
-              tensorBuffer(b) = (batch.data.narrow(1, b * stackSize + 1, stackSize),
-                batch.labels.narrow(1, b * stackSize + 1, stackSize))
-              b += 1
-            }
-          })
-          Engine.default.sync(tasks)
-          tasks.clear()
+          t = System.nanoTime()
+          parameters.putGradients(gradient)
+          driverMetrics.add("put gradient", System.nanoTime() - t)
+          parameters.job1Start = false
+          iter
+        }
 
-          // ======================Start train models===================================
-          var time = System.nanoTime()
-          if(dropPercentage > 0 && iteration > warmupIterationNum + computeThresholdbatchSize - 1) {
-            timeout = threshold - weightSyncTime
-          }
-          val pre = (iteration % computeThresholdbatchSize) * _subModelNumber
-          val trainingThreads = Engine.default.invokeAndWait2((0 until _subModelNumber).map(i =>
-            () => {
-              val trainStart = System.nanoTime()
-              val localModel = cached.localModels(i)
-              localModel.training()
-              val localCriterion = cached.localCriterions(i)
-              val (input, target) = tensorBuffer(i)
-              val output = localModel.forward(input)
-              lossArray(i) = ev.toType[Double](localCriterion.forward(output, target))
-              val errors = localCriterion.backward(output, target)
-              localModel.backward(input, errors)
-              cached.moduleTimeList(i + pre) = System.nanoTime() - trainStart + weightSyncTime
-              i
-            }
-          ), timeout)
-          val computingTime = System.nanoTime() - time
-          driverMetrics.add("computing time average", computingTime)
+        val aggregatedModels = putGradients.mapPartitions { iter =>
+          val modelValues = iter.next()
+          assert(iter.isEmpty) // Should be only 1 key per partition
+          val finishedModelNum = modelValues.map(x => x._1).sum
+          val lossSum = modelValues.map(_._2).sum
+          val recordNumSum = modelValues.map(_._3).sum
 
-          time = System.nanoTime()
-          val finishedThreads = trainingThreads.filter(!_.isCancelled).map(_.get())
-          recordsNum += finishedThreads.size * tensorBuffer.head._2.size(1)
-          var i = 0
+          dropModelNumBatch += (driverSubModelNum - finishedModelNum)
+          if (dropPercentage == 0 || finishedModelNum >= driverSubModelNum * (1-maxDropPercentage)) {
+            val value = lossSum / finishedModelNum
 
-          while (i < finishedThreads.size) {
-            lossSum += lossArray(finishedThreads(i))
-            i += 1
-          }
+            val nodeNumber = Engine.nodeNumber()
+            val executorId = SparkEnv.get.executorId
+            val parameters = ParameterManager2.get(executorId)
+            val params = new Array[CompressedTensor[T]](nodeNumber)
+            val getG = System.nanoTime()
+            parameters.aggregrateGradientParition(params)
+            driverMetrics.add("aggregrateGradientParition average executor",
+              System.nanoTime() - getG)
 
-          if (finishedThreads.size > 0) {
+            var time = System.nanoTime()
+            val gradients = parameters.getLocalParameter[T](parameters.getGradientExecutorId())
+            gradients.div(ev.fromType(finishedModelNum))
+            val weights = parameters.getLocalParameter[T](parameters.getWeightExecutorId())
+            val state = parameters.getState()
+            state("neval") = driverState[Int]("neval")
+            state("epoch") = driverState[Int]("epoch")
+
+            optimMethod.optimize(_ => (ev.fromType(value), gradients),
+              weights, state, state)
+            driverMetrics.add("compute weight average", System.nanoTime() - time)
             time = System.nanoTime()
-            val gradLength = cached.modelGradients(0).nElement()
-            val taskSize = gradLength / _subModelNumber
-            val extraTask = gradLength % _subModelNumber
-
-            (0 until _subModelNumber).diff(finishedThreads).foreach(i =>
-              cached.modelGradients(i).zero()
-            )
-
-            // copy multi-model gradient to the buffer
-            val parallelNum = if (taskSize == 0) extraTask else _subModelNumber
-            Engine.default.invokeAndWait((0 until parallelNum).map(tid => () => {
-              val offset = tid * taskSize + math.min(tid, extraTask)
-              val length = taskSize + (if (tid < extraTask) 1 else 0)
-              var i = 0
-              while (i < cached.modelGradients.length) {
-                if (i == 0) {
-                  cached.gradient.narrow(1, offset + 1, length)
-                    .copy(cached.modelGradients(i).narrow(1, offset + 1, length))
-                } else {
-                  cached.gradient.narrow(1, offset + 1, length)
-                    .add(cached.modelGradients(i).narrow(1, offset + 1, length))
-                }
-                i += 1
-              }
-            }))
+            parameters.sendWeightExecutor()
+            driverMetrics.add("send weights average", System.nanoTime() - time)
+            Iterator.single((recordNumSum, lossSum, finishedModelNum, true))
+          } else {
+            logger.info(s"Warning!!! Ignore this iteration as more than maxDropPercentage " +
+              s"module is dropped!! Finished modules number: ${finishedModelNum}")
+            Iterator.single((recordNumSum, lossSum, finishedModelNum, false))
           }
+        }
+        aggregatedModels
+      }
 
-          tasks ++= Engine.default.invoke((0 until _subModelNumber).map(i => () => {
-            cached.localModels(i).training()
-            cached.localModels(i).zeroGradParameters()
-          }))
-          driverMetrics.add("aggregate gradient time", System.nanoTime() - time)
+      val collectFunc = (iter: Iterator[(Int, Double, Int, Boolean)]) => iter.next
 
-          time = System.nanoTime()
-          parameters.sendGradientPartition(cached.gradient, TaskContext.getPartitionId())
-          driverMetrics.add("send gradient partition", System.nanoTime() - time)
+      // We get resultsfrom each iteration run inside the drizzle group.
+      val drizzleIterationResults = drizzleRDDs.map { rdd =>
+        sc.runJob(rdd, collectFunc).head
+      }
 
-          Iterator.single(finishedThreads.size)
-        }).reduce(_ + _)
+      // At this point we use the last iteration's loss and finishedModelNum and notIterationIgnored
+      // We aggregate the recordsNumFinished across them
+      val recordsNumFinished = drizzleIterationResults.map(_._1).reduceLeft(_ + _)
+      val lossSumFinished = drizzleIterationResults.last._2
+      val finishedModelNum = drizzleIterationResults.last._3
+      val notIterationIgnored = drizzleIterationResults.last._4 // Note this should be the same on all tasks
 
-      val job2start = System.nanoTime()
-      dummyRDD.mapPartitions { iter =>
-        val executorId = SparkEnv.get.executorId
-        val parameters = ParameterManager2.get(executorId)
-        var t = System.nanoTime()
-        val gradient = parameters.aggregateLocalGradient()
-        driverMetrics.add("aggregate local gradient", System.nanoTime() - t)
-
-        t = System.nanoTime()
-        parameters.putGradients(gradient)
-        driverMetrics.add("put gradient", System.nanoTime() - t)
-        parameters.job1Start = false
-        Iterator.empty
-      }.count()
-      
-      val job2end = System.nanoTime()
-      dropModelNumBatch += (driverSubModelNum - finishedModelNum)
-      if (dropPercentage == 0 || finishedModelNum >= driverSubModelNum * (1-maxDropPercentage)) {
-        val value = lossSum.value / finishedModelNum
-
-        val nodeNumber = Engine.nodeNumber()
-        val job3start = System.nanoTime()
-        dummyRDD.mapPartitions { iter =>
-          val executorId = SparkEnv.get.executorId
-          val parameters = ParameterManager2.get(executorId)
-          val params = new Array[CompressedTensor[T]](nodeNumber)
-          val getG = System.nanoTime()
-          parameters.aggregrateGradientParition(params)
-          driverMetrics.add("aggregrateGradientParition average executor",
-            System.nanoTime() - getG)
-
-          var time = System.nanoTime()
-          val gradients = parameters.getLocalParameter[T](parameters.getGradientExecutorId())
-          gradients.div(ev.fromType(finishedModelNum))
-          val weights = parameters.getLocalParameter[T](parameters.getWeightExecutorId())
-          val state = parameters.getState()
-          state("neval") = driverState[Int]("neval")
-          state("epoch") = driverState[Int]("epoch")
-          
-          optimMethod.optimize(_ => (ev.fromType(value), gradients),
-            weights, state, state)
-          driverMetrics.add("compute weight average", System.nanoTime() - time)
-          time = System.nanoTime()
-          parameters.sendWeightExecutor()
-          driverMetrics.add("send weights average", System.nanoTime() - time)
-          Iterator.empty
-        }.count()
-        val job3end = System.nanoTime()
-
-        accumulateCount += recordsNum.value
+      if (notIterationIgnored) {
+        accumulateCount += recordsNumFinished
         val end = System.nanoTime()
         wallClockTime += end - start
-        optimMethod.updateHyperParameter(state, driverState)
-        driverState("Loss") = lossSum.value.toFloat / finishedModelNum
-        driverState("Throughput") = recordsNum.value.toFloat / ((end - start) / 1e9f)
-        if (state.contains("clr")) driverState("LearningRate") = -state[Double]("clr").toFloat
+        // optimMethod.updateHyperParameter(state, driverState)
+        driverState("Loss") = lossSumFinished.toFloat / finishedModelNum
+        driverState("Throughput") = recordsNumFinished.toFloat / ((end - start) / 1e9f)
+        // if (state.contains("clr")) driverState("LearningRate") = -state[Double]("clr").toFloat
         logger.info(s"${_header} Train ${recordsNum.value} in ${(end - start) / 1e9}seconds. " +
-          s"Throughput is ${driverState("Throughput")} records/second. Loss is ${
-            driverState("Loss")}. ${optimMethod.getHyperParameter(state)}")
-        logger.debug(s"job1 driver: ${(job2start-start)/1e9} " +
-          s"job2 driver: ${(job2end-job2start)/1e9} job3 driver: ${(job3end-job3start)/1e9}")
+          s"Throughput is ${driverState("Throughput")} records/second. ")
+        // logger.info(s"Loss is ${ driverState("Loss")}. ${optimMethod.getHyperParameter(state)}")
         logger.info("\n" + metrics.summary())
-        lossArray = new Array[Double](_subModelNumber)
 
         // compute threshold
-        iteration += 1
+        iteration += drizzleGroupSize
         if (dropPercentage > 0 && iteration > warmupIterationNum &&
           iteration % computeThresholdbatchSize == 0) {
           val moduleTimeList = models.mapPartitions { iter =>
@@ -366,7 +423,7 @@ object DistriOptimizer {
           dropModelNumBatch = 0
         }
 
-        driverState("neval") = driverState[Int]("neval") + 1
+        driverState("neval") = driverState[Int]("neval") + drizzleGroupSize
         if (accumulateCount >= dataset.size()) {
           val epochEnd = System.nanoTime()
           wallClockTime = lastEpochTime + epochEnd - epochStart
@@ -406,10 +463,6 @@ object DistriOptimizer {
           models,
           driverState
         )
-
-      } else {
-        logger.info(s"Warning!!! Ignore this iteration as more than maxDropPercentage " +
-          s"module is dropped!! Finished modules number: ${finishedModelNum}")
       }
     }
   }
@@ -546,7 +599,7 @@ object DistriOptimizer {
     val pm = ParameterManager2.createParameterManager(executorIdMap(driver), nodeNumber,
       partitionNum, parameterSize)
     val actualPort = pm.master.driverEndpoint.address.port
-    
+
     val nExecutor = Engine.nodeNumber()
     val executorCores = Engine.coreNumber()
 
@@ -593,7 +646,7 @@ object DistriOptimizer {
           c._2.storage().set(parameter.getLocalParameter[T](blockId).storage())
         }
       }
-      
+
       logger.info("model thread pool size is " + Engine.model.getPoolSize)
 
       Iterator.single(Cache(
@@ -782,13 +835,13 @@ class DistriOptimizer[T: ClassTag] (
     val actualNodeNumber = dataset.originRDD().mapPartitions { iter =>
       Iterator(SparkEnv.get.executorId)
     }.collect().distinct.size
-    
+
     val coresPerNode = Engine.coreNumber()
     println("core number: " + coresPerNode)
     Engine.setNodeNumber(actualNodeNumber)
     dataset.originRDD().sparkContext.getConf.setExecutorEnv("DL_NODE_NUMBER",
       actualNodeNumber.toString)
-    
+
     val partitionNum = dataset.originRDD().partitions.length
     val size = model.getParameters()._1.nElement()
 
