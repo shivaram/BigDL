@@ -367,11 +367,13 @@ object DistriOptimizer {
       }
 
       val collectFunc = (iter: Iterator[(Int, Double, Int, Boolean)]) => iter.next
+      val collectFuncs = Array.fill(drizzleGroupSize)(collectFunc)
 
       // We get resultsfrom each iteration run inside the drizzle group.
-      val drizzleIterationResults = drizzleRDDs.map { rdd =>
-        sc.runJob(rdd, collectFunc).head
-      }
+      // val drizzleIterationResults = drizzleRDDs.map { rdd =>
+      //   sc.runJob(rdd, collectFunc).head
+      // }
+      val drizzleIterationResults = sc.runJobs(drizzleRDDs, collectFuncs).map(x => x.head)
 
       // At this point we use the last iteration's loss and finishedModelNum and notIterationIgnored
       // We aggregate the recordsNumFinished across them

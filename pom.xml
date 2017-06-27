@@ -170,7 +170,7 @@
         <collections.version>3.2.1</collections.version>
         <scoverage.plugin.version>1.1.1</scoverage.plugin.version>
         <spark-version.project>1.6</spark-version.project>
-        <spark.version>1.6.0</spark.version>
+        <spark.version>1.6.2-drizzle</spark.version>
         <spark-scope>provided</spark-scope>
 
         <mkl-java-os-version>mkl-java</mkl-java-os-version>
@@ -506,8 +506,8 @@
 	<profile>
             <id>spark_1.6</id>
             <properties>
-                <spark-version.project>1.5-plus</spark-version.project>
-                <spark.version>1.6.0</spark.version>
+                <spark-version.project>1.6</spark-version.project>
+                <spark.version>1.6.2-drizzle</spark.version>
                 <scala.major.version>2.10</scala.major.version>
                 <scala.version>2.10.5</scala.version>
                 <scala.macros.version>2.0.1</scala.macros.version>
