@@ -395,7 +395,7 @@ object DistriOptimizer {
         driverState("Loss") = lossSumFinished.toFloat / finishedModelNum
         driverState("Throughput") = recordsNumFinished.toFloat / ((end - start) / 1e9f)
         // if (state.contains("clr")) driverState("LearningRate") = -state[Double]("clr").toFloat
-        logger.info(s"Epoch ${driverState[Int]("epoch")} took ${(end-start) / 1e9} seconds")
+        logger.info(s"Iteration ${driverState[Int]("neval")} took ${(end-start) / 1e9} seconds")
         // logger.info(s"${_header} Train ${recordsNum.value} in ${(end - start) / 1e9}seconds. " +
         //  s"Throughput is ${driverState("Throughput")} records/second. ")
         // logger.info(s"Loss is ${ driverState("Loss")}. ${optimMethod.getHyperParameter(state)}")
