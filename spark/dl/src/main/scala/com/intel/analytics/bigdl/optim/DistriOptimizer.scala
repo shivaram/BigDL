@@ -328,12 +328,13 @@ object DistriOptimizer {
         driverState("Loss") = lossSum.value.toFloat / finishedModelNum
         driverState("Throughput") = recordsNum.value.toFloat / ((end - start) / 1e9f)
         if (state.contains("clr")) driverState("LearningRate") = -state[Double]("clr").toFloat
-        logger.info(s"${_header} Train ${recordsNum.value} in ${(end - start) / 1e9}seconds. " +
-          s"Throughput is ${driverState("Throughput")} records/second. Loss is ${
-            driverState("Loss")}. ${optimMethod.getHyperParameter(state)}")
-        logger.debug(s"job1 driver: ${(job2start-start)/1e9} " +
-          s"job2 driver: ${(job2end-job2start)/1e9} job3 driver: ${(job3end-job3start)/1e9}")
-        logger.info("\n" + metrics.summary())
+        logger.info(s"Iteration ${driverState[Int]("neval")} took ${(end - start) / 1e9} seconds")
+      	// logger.info(s"${_header} Train ${recordsNum.value} in ${(end - start) / 1e9}seconds. " +
+      	//   s"Throughput is ${driverState("Throughput")} records/second. Loss is ${
+      	//     driverState("Loss")}. ${optimMethod.getHyperParameter(state)}")
+      	// logger.debug(s"job1 driver: ${(job2start-start)/1e9} " +
+      	//   s"job2 driver: ${(job2end-job2start)/1e9} job3 driver: ${(job3end-job3start)/1e9}")
+      	// logger.info("\n" + metrics.summary())
         lossArray = new Array[Double](_subModelNumber)
 
         // compute threshold
