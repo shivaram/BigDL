@@ -306,7 +306,7 @@ object DistriOptimizer {
             (0 until Engine.nodeNumber()).map { p =>
               (p, out)
             }
-          }.groupByKey(dummyPartitioner).values
+          }.groupByKey(dummyPartitioner)
 
         val putGradients = finishedModels.mapPartitions { iter =>
           val executorId = SparkEnv.get.executorId
@@ -319,16 +319,21 @@ object DistriOptimizer {
           parameters.putGradients(gradient)
           driverMetrics.add("put gradient", System.nanoTime() - t)
           parameters.job1Start = false
-          iter
-        }
 
-        val aggregatedModels = putGradients.mapPartitions { iter =>
-          val modelValues = iter.next()
+          val modelValues = iter.map(_._2).next()
           assert(iter.isEmpty) // Should be only 1 key per partition
           val finishedModelNum = modelValues.map(x => x._1).sum
           val lossSum = modelValues.map(_._2).sum
           val recordNumSum = modelValues.map(_._3).sum
 
+          // Emit one key per partition of dummyRDD
+          (0 until Engine.nodeNumber()).map { p =>
+            (p, (finishedModelNum, lossSum, recordNumSum))
+          }.iterator
+        }.partitionBy(dummyPartitioner).values
+
+        val aggregatedModels = putGradients.mapPartitions { iter =>
+	  val (finishedModelNum, lossSum, recordNumSum) = iter.next()
           dropModelNumBatch += (driverSubModelNum - finishedModelNum)
           if (dropPercentage == 0 || finishedModelNum >= driverSubModelNum * (1-maxDropPercentage)) {
             val value = lossSum / finishedModelNum
@@ -390,10 +395,11 @@ object DistriOptimizer {
         driverState("Loss") = lossSumFinished.toFloat / finishedModelNum
         driverState("Throughput") = recordsNumFinished.toFloat / ((end - start) / 1e9f)
         // if (state.contains("clr")) driverState("LearningRate") = -state[Double]("clr").toFloat
-        logger.info(s"${_header} Train ${recordsNum.value} in ${(end - start) / 1e9}seconds. " +
-          s"Throughput is ${driverState("Throughput")} records/second. ")
+        logger.info(s"Epoch ${driverState[Int]("epoch")} took ${(end-start) / 1e9} seconds")
+        // logger.info(s"${_header} Train ${recordsNum.value} in ${(end - start) / 1e9}seconds. " +
+        //  s"Throughput is ${driverState("Throughput")} records/second. ")
         // logger.info(s"Loss is ${ driverState("Loss")}. ${optimMethod.getHyperParameter(state)}")
-        logger.info("\n" + metrics.summary())
+        // logger.info("\n" + metrics.summary())
 
         // compute threshold
         iteration += drizzleGroupSize
