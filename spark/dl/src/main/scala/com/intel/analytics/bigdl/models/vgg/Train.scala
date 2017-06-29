@@ -34,6 +34,9 @@ object Train {
   def main(args: Array[String]): Unit = {
     trainParser.parse(args, new TrainParams()).map(param => {
       val conf = Engine.createSparkConf().setAppName("Train Vgg on Cifar10")
+      if (param.drizzleGroupSize > 1) {
+        conf.set("spark.scheduler.drizzle", "true")
+      }
       val sc = new SparkContext(conf)
 //      Engine.init
       Engine.init(param.nodeNum, param.corePerTask, true)
@@ -58,7 +61,8 @@ object Train {
           "weightDecay" -> 0.0005,
           "momentum" -> 0.9,
           "dampening" -> 0.0,
-          "learningRateSchedule" -> SGD.EpochStep(25, 0.5)
+          "learningRateSchedule" -> SGD.EpochStep(25, 0.5),
+          "drizzleGroupSize" -> param.drizzleGroupSize
         )
       }
 

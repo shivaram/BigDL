@@ -40,7 +40,8 @@ object Utils {
     overWriteCheckpoint: Boolean = false,
     partitionNum: Int = -1,
     nodeNum: Int = -1,
-    corePerTask: Int = -1
+    corePerTask: Int = -1,
+    drizzleGroupSize: Int = 1
   )
 
   val trainParser = new OptionParser[TrainParams]("BigDL Vgg on Cifar10 Example") {
@@ -77,6 +78,9 @@ object Utils {
       .text("core number per task")
       .action((x, c) => c.copy(corePerTask = x))
       .required()
+    opt[Int]("drizzleGroupSize")
+      .text("drizzle group size")
+      .action((x, c) => c.copy(drizzleGroupSize = x))
   }
 
   case class TestParams(

@@ -260,6 +260,7 @@ object DistriOptimizer {
     val warmupIterationNum = state.get[Int]("warmupIterationNum").get
     val computeThresholdbatchSize = state.get[Int]("computeThresholdbatchSize").get
     val drizzleGroupSize = state.get[Int]("drizzleGroupSize").getOrElse(1)
+    logger.info("DRIZZLE group size " + drizzleGroupSize)
     val maxDropPercentage = state.get[Double]("maxDropPercentage").get
     val driverSubModelNum = partitionNum * _subModelNumber
     var dropModelNumBatch = 0
@@ -375,10 +376,10 @@ object DistriOptimizer {
       val collectFuncs = Array.fill(drizzleGroupSize)(collectFunc)
 
       // We get resultsfrom each iteration run inside the drizzle group.
-      val drizzleIterationResults = drizzleRDDs.map { rdd =>
-        sc.runJob(rdd, collectFunc).head
-      }
-      // val drizzleIterationResults = sc.runJobs(drizzleRDDs, collectFuncs).map(x => x.head)
+      // val drizzleIterationResults = drizzleRDDs.map { rdd =>
+      //   sc.runJob(rdd, collectFunc).head
+      // }
+      val drizzleIterationResults = sc.runJobs(drizzleRDDs, collectFuncs).map(x => x.head)
 
       // At this point we use the last iteration's loss and finishedModelNum and notIterationIgnored
       // We aggregate the recordsNumFinished across them
