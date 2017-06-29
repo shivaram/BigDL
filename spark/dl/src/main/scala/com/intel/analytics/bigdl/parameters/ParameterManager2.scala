@@ -126,6 +126,7 @@ class ParameterManager2(val id: Int, val executorId: Int,
 //  def aggregateLocalGradient[T: ClassTag]() : (Tensor[T], Int, Double) = {
   def aggregateLocalGradient[T: ClassTag]() : Tensor[T] = {
     val blockIds = master.getBlockId(executorId)
+    logger.info("Got blocks " + blockIds.mkString(",") + " for exec " + executorId)
     val gradientBuffer = new Array[Tensor[T]](blockIds.size)
     val lossArray = new Array[Array[Double]](blockIds.size)
     Engine.pmPool.invokeAndWait((0 until blockIds.size).map(tid => () => {
@@ -150,6 +151,7 @@ class ParameterManager2(val id: Int, val executorId: Int,
         i += 1
       }
     }))
+    logger.info("Clearing blocks for exec " + executorId)
     master.clearBlockId(executorId)
 //    (gradientBuffer(0), blockIds.size, lossArray.flatten.sum)
     gradientBuffer(0)
@@ -317,6 +319,7 @@ class ParameterManager2(val id: Int, val executorId: Int,
         BlockManagerWrapper.putSingle(gradientsId, gradient,
           StorageLevel.MEMORY_AND_DISK, tellMaster = false)
     }
+    logger.info("Updating blockId " + gradientsId + " for exec " + executorId)
     master.updateBlockId(executorId, gradientsId)
   }
 
