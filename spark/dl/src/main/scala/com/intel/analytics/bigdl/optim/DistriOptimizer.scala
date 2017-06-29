@@ -260,6 +260,8 @@ object DistriOptimizer {
     val warmupIterationNum = state.get[Int]("warmupIterationNum").get
     val computeThresholdbatchSize = state.get[Int]("computeThresholdbatchSize").get
     val drizzleGroupSize = state.get[Int]("drizzleGroupSize").getOrElse(1)
+    val useDrizzle = state.get[Boolean]("useDrizzle").getOrElse(true)
+
     logger.info("DRIZZLE group size " + drizzleGroupSize)
     val maxDropPercentage = state.get[Double]("maxDropPercentage").get
     val driverSubModelNum = partitionNum * _subModelNumber
@@ -268,13 +270,6 @@ object DistriOptimizer {
     var epochStart = System.nanoTime()
     var dataRDD = dataset.data(train = true)
     val dummyPartitioner = new HashPartitioner(Engine.nodeNumber())
-    // This creates an RDD with nodeNumber partitions and
-    // partitions them using the above partitioner
-    val dummyRDD = CoalescedWithLocalityRDD(models, Engine.nodeNumber())
-      .mapPartitionsWithIndex { case (idx, iter) =>
-        Iterator.single( (idx, 1) )
-      }.partitionBy(dummyPartitioner).cache()
-    dummyRDD.count()
 
     while (!endWhen(driverState)) {
       val _header = header(driverState[Int]("epoch"), accumulateCount, dataset.size(),
@@ -299,7 +294,7 @@ object DistriOptimizer {
       // Build up the drizzle RDDs
       val drizzleRDDs = (0 until drizzleGroupSize).map { dIter =>
         val curIter = iteration + dIter
-        val finishedModels = dataRDD.zipPartitions(models, true)((data, modelIter) => {
+        val finishedModels = models.zipPartitions(dataRDD, true)((modelIter, data) => {
             runTrainingOnExecutor(data, modelIter, driverMetrics, _subModelNumber, dropPercentage,
               curIter, warmupIterationNum, computeThresholdbatchSize, ev, threshold)
           }).flatMap { out =>
@@ -310,76 +305,92 @@ object DistriOptimizer {
           }.groupByKey(dummyPartitioner)
 
         val putGradients = finishedModels.mapPartitions { iter =>
-          val executorId = SparkEnv.get.executorId
-          val parameters = ParameterManager2.get(executorId)
-          var t = System.nanoTime()
-          val gradient = parameters.aggregateLocalGradient()
-          driverMetrics.add("aggregate local gradient", System.nanoTime() - t)
+          if (iter.hasNext) {
+            val executorId = SparkEnv.get.executorId
+            val parameters = ParameterManager2.get(executorId)
+            var t = System.nanoTime()
+            val gradient = parameters.aggregateLocalGradient()
+            driverMetrics.add("aggregate local gradient", System.nanoTime() - t)
 
-          t = System.nanoTime()
-          parameters.putGradients(gradient)
-          driverMetrics.add("put gradient", System.nanoTime() - t)
-          parameters.job1Start = false
+            t = System.nanoTime()
+            parameters.putGradients(gradient)
+            driverMetrics.add("put gradient", System.nanoTime() - t)
+            parameters.job1Start = false
 
-          val modelValues = iter.map(_._2).next()
-          assert(iter.isEmpty) // Should be only 1 key per partition
-          val finishedModelNum = modelValues.map(x => x._1).sum
-          val lossSum = modelValues.map(_._2).sum
-          val recordNumSum = modelValues.map(_._3).sum
+            val modelValues = iter.map(_._2).next()
+            assert(iter.isEmpty) // Should be only 1 key per partition
+            val finishedModelNum = modelValues.map(x => x._1).sum
+            val lossSum = modelValues.map(_._2).sum
+            val recordNumSum = modelValues.map(_._3).sum
 
-          // Emit one key per partition of dummyRDD
-          (0 until Engine.nodeNumber()).map { p =>
-            (p, (finishedModelNum, lossSum, recordNumSum))
-          }.iterator
+            // Emit one key per partition of dummyRDD
+            (0 until Engine.nodeNumber()).map { p =>
+              (p, (finishedModelNum, lossSum, recordNumSum))
+            }.iterator
+          } else {
+            Iterator.empty
+          }
         }.partitionBy(dummyPartitioner).values
 
         val aggregatedModels = putGradients.mapPartitions { iter =>
-	  val (finishedModelNum, lossSum, recordNumSum) = iter.next()
-          dropModelNumBatch += (driverSubModelNum - finishedModelNum)
-          if (dropPercentage == 0 || finishedModelNum >= driverSubModelNum * (1-maxDropPercentage)) {
-            val value = lossSum / finishedModelNum
+          if (iter.hasNext) {
+            val (finishedModelNum, lossSum, recordNumSum) = iter.next()
+            dropModelNumBatch += (driverSubModelNum - finishedModelNum)
+            if (dropPercentage == 0 || finishedModelNum >= driverSubModelNum * (1-maxDropPercentage)) {
+              val value = lossSum / finishedModelNum
 
-            val nodeNumber = Engine.nodeNumber()
-            val executorId = SparkEnv.get.executorId
-            val parameters = ParameterManager2.get(executorId)
-            val params = new Array[CompressedTensor[T]](nodeNumber)
-            val getG = System.nanoTime()
-            parameters.aggregrateGradientParition(params)
-            driverMetrics.add("aggregrateGradientParition average executor",
-              System.nanoTime() - getG)
+              val nodeNumber = Engine.nodeNumber()
+              val executorId = SparkEnv.get.executorId
+              val parameters = ParameterManager2.get(executorId)
+              val params = new Array[CompressedTensor[T]](nodeNumber)
+              val getG = System.nanoTime()
+              parameters.aggregrateGradientParition(params)
+              driverMetrics.add("aggregrateGradientParition average executor",
+                System.nanoTime() - getG)
 
-            var time = System.nanoTime()
-            val gradients = parameters.getLocalParameter[T](parameters.getGradientExecutorId())
-            gradients.div(ev.fromType(finishedModelNum))
-            val weights = parameters.getLocalParameter[T](parameters.getWeightExecutorId())
-            val state = parameters.getState()
-            state("neval") = driverState[Int]("neval")
-            state("epoch") = driverState[Int]("epoch")
+              var time = System.nanoTime()
+              val gradients = parameters.getLocalParameter[T](parameters.getGradientExecutorId())
+              gradients.div(ev.fromType(finishedModelNum))
+              val weights = parameters.getLocalParameter[T](parameters.getWeightExecutorId())
+              val state = parameters.getState()
+              state("neval") = driverState[Int]("neval")
+              state("epoch") = driverState[Int]("epoch")
 
-            optimMethod.optimize(_ => (ev.fromType(value), gradients),
-              weights, state, state)
-            driverMetrics.add("compute weight average", System.nanoTime() - time)
-            time = System.nanoTime()
-            parameters.sendWeightExecutor()
-            driverMetrics.add("send weights average", System.nanoTime() - time)
-            Iterator.single((recordNumSum, lossSum, finishedModelNum, true))
+              optimMethod.optimize(_ => (ev.fromType(value), gradients),
+                weights, state, state)
+              driverMetrics.add("compute weight average", System.nanoTime() - time)
+              time = System.nanoTime()
+              parameters.sendWeightExecutor()
+              driverMetrics.add("send weights average", System.nanoTime() - time)
+              Iterator.single((recordNumSum, lossSum, finishedModelNum, true))
+            } else {
+              logger.info(s"Warning!!! Ignore this iteration as more than maxDropPercentage " +
+                s"module is dropped!! Finished modules number: ${finishedModelNum}")
+              Iterator.single((recordNumSum, lossSum, finishedModelNum, false))
+            }
           } else {
-            logger.info(s"Warning!!! Ignore this iteration as more than maxDropPercentage " +
-              s"module is dropped!! Finished modules number: ${finishedModelNum}")
-            Iterator.single((recordNumSum, lossSum, finishedModelNum, false))
+            Iterator.empty
           }
         }
         aggregatedModels
       }
 
-      val collectFunc = (iter: Iterator[(Int, Double, Int, Boolean)]) => iter.next
+      val collectFunc = (iter: Iterator[(Int, Double, Int, Boolean)]) => {
+        if (iter.hasNext) {
+          iter.next
+        } else {
+          (-1, 0.0, 0, false)
+        }
+      }
       val collectFuncs = Array.fill(drizzleGroupSize)(collectFunc)
 
-      // We get resultsfrom each iteration run inside the drizzle group.
-      // val drizzleIterationResults = drizzleRDDs.map { rdd =>
-      //   sc.runJob(rdd, collectFunc).head
-      // }
-      val drizzleIterationResults = sc.runJobs(drizzleRDDs, collectFuncs).map(x => x.head)
+      val drizzleIterationResults = if (useDrizzle && drizzleGroupSize > 1) {
+        sc.runJobs(drizzleRDDs, collectFuncs).map(x => x.filter(y => y._1 != -1).head)
+      } else {
+        drizzleRDDs.map { rdd =>
+          sc.runJob(rdd, collectFunc).filter(x => x._1 != -1).head
+        }
+      }
 
       // At this point we use the last iteration's loss and finishedModelNum and notIterationIgnored
       // We aggregate the recordsNumFinished across them
