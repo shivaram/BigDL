@@ -34,6 +34,8 @@ object Train {
   def main(args: Array[String]): Unit = {
     trainParser.parse(args, new TrainParams()).map(param => {
       val conf = Engine.createSparkConf().setAppName("Train Vgg on Cifar10")
+      // NOTE(shivaram): This is required for Drizzle to work correctly
+      conf.set("spark.executor.drizzle.barrierAcrossBatches", "true")
       val sc = new SparkContext(conf)
 //      Engine.init
       Engine.init(param.nodeNum, param.corePerTask, true)
