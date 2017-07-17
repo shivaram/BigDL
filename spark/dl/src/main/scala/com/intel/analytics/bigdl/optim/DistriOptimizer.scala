@@ -278,9 +278,10 @@ object DistriOptimizer {
         driverState("Loss") = lossSum.value.toFloat / finishedModelNum
         driverState("Throughput") = recordsNum.value.toFloat / ((end - start) / 1e9f)
         driverState("LearningRate") = -optimMethod.getLearningRate().toFloat
-        logger.info(s"${_header} Train ${recordsNum.value} in ${(end - start) / 1e9}seconds. " +
-          s"Throughput is ${driverState("Throughput")} records/second. Loss is ${
-            driverState("Loss")}. ${optimMethod.getHyperParameter()}")
+        // logger.info(s"${_header} Train ${recordsNum.value} in ${(end - start) / 1e9}seconds. " +
+        //   s"Throughput is ${driverState("Throughput")} records/second. Loss is ${
+        //     driverState("Loss")}. ${optimMethod.getHyperParameter()}")
+        logger.info(s"Iteration ${driverState[Int]("neval")} took ${(end - start) / 1e9} seconds")
         logger.debug("\n" + metrics.summary())
         logger.debug("Dropped modules: " + (driverSubModelNum - finishedModelNum))
         lossArray = new Array[Double](_subModelNumber)
