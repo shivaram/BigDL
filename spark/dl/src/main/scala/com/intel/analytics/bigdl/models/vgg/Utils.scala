@@ -41,8 +41,7 @@ object Utils {
     partitionNum: Int = -1,
     nodeNum: Int = -1,
     corePerTask: Int = -1,
-    drizzleGroupSize: Int = 1,
-    useDrizzle: Boolean = true
+    drizzleGroupSize: Int = 1
   )
 
   val trainParser = new OptionParser[TrainParams]("BigDL Vgg on Cifar10 Example") {
@@ -82,9 +81,6 @@ object Utils {
     opt[Int]("drizzleGroupSize")
       .text("drizzle group size")
       .action((x, c) => c.copy(drizzleGroupSize = x))
-    opt[Boolean]("useDrizzle")
-      .text("use drizzle or not")
-      .action((x, c) => c.copy(useDrizzle = x))
   }
 
   case class TestParams(

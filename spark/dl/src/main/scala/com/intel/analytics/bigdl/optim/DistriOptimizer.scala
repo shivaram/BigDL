@@ -32,6 +32,7 @@ import com.intel.analytics.bigdl.visualization.{TrainSummary, ValidationSummary}
 import org.apache.log4j.Logger
 import org.apache.spark.{SparkEnv, TaskContext, HashPartitioner}
 import org.apache.spark.rdd.{RDD, ZippedPartitionsWithLocalityRDD, CoalescedWithLocalityRDD}
+import org.apache.spark.scheduler.JobRunnerWrapper
 
 import scala.collection.mutable
 import scala.collection.mutable.ArrayBuffer
@@ -260,7 +261,6 @@ object DistriOptimizer {
     val warmupIterationNum = state.get[Int]("warmupIterationNum").get
     val computeThresholdbatchSize = state.get[Int]("computeThresholdbatchSize").get
     val drizzleGroupSize = state.get[Int]("drizzleGroupSize").getOrElse(1)
-    val useDrizzle = state.get[Boolean]("useDrizzle").getOrElse(true)
 
     logger.info("DRIZZLE group size " + drizzleGroupSize)
     val maxDropPercentage = state.get[Double]("maxDropPercentage").get
@@ -384,13 +384,9 @@ object DistriOptimizer {
       }
       val collectFuncs = Array.fill(drizzleGroupSize)(collectFunc)
 
-      val drizzleIterationResults = if (useDrizzle && drizzleGroupSize > 1) {
-        sc.runJobs(drizzleRDDs, collectFuncs).map(x => x.filter(y => y._1 != -1).head)
-      } else {
-        drizzleRDDs.map { rdd =>
-          sc.runJob(rdd, collectFunc).filter(x => x._1 != -1).head
-        }
-      }
+      val allResults = JobRunnerWrapper.runJobs(sc, drizzleRDDs, collectFuncs)
+
+      val drizzleIterationResults = allResults.map(x => x.filter(y => y._1 != -1).head)
 
       // At this point we use the last iteration's loss and finishedModelNum and notIterationIgnored
       // We aggregate the recordsNumFinished across them
