@@ -61,7 +61,8 @@ object Train {
           "momentum" -> 0.9,
           "dampening" -> 0.0,
           "learningRateSchedule" -> SGD.EpochStep(25, 0.5),
-          "drizzleGroupSize" -> param.drizzleGroupSize
+          "drizzleGroupSize" -> param.drizzleGroupSize,
+          "useDrizzle" -> param.useDrizzle
         )
       }
 

@@ -26,7 +26,8 @@ object JobRunnerWrapper {
   def runJobs[T, U:ClassTag](
       sc: SparkContext,
       rdds: Seq[RDD[T]],
-      funcs: Seq[Iterator[T] => U]): Seq[Array[U]] = {
+      funcs: Seq[Iterator[T] => U],
+      useDrizzle: Boolean): Seq[Array[U]] = {
     rdds.zip(funcs).map { case (rdd, func) =>
       sc.runJob(rdd, func)
     }

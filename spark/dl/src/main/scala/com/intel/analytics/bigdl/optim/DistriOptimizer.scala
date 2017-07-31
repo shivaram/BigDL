@@ -261,6 +261,7 @@ object DistriOptimizer {
     val warmupIterationNum = state.get[Int]("warmupIterationNum").get
     val computeThresholdbatchSize = state.get[Int]("computeThresholdbatchSize").get
     val drizzleGroupSize = state.get[Int]("drizzleGroupSize").getOrElse(1)
+    val useDrizzle = state.get[Boolean]("useDrizzle").getOrElse(false)
 
     logger.info("DRIZZLE group size " + drizzleGroupSize)
     val maxDropPercentage = state.get[Double]("maxDropPercentage").get
@@ -384,7 +385,7 @@ object DistriOptimizer {
       }
       val collectFuncs = Array.fill(drizzleGroupSize)(collectFunc)
 
-      val allResults = JobRunnerWrapper.runJobs(sc, drizzleRDDs, collectFuncs)
+      val allResults = JobRunnerWrapper.runJobs(sc, drizzleRDDs, collectFuncs, useDrizzle)
 
       val drizzleIterationResults = allResults.map(x => x.filter(y => y._1 != -1).head)
 

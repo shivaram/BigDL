@@ -26,9 +26,15 @@ object JobRunnerWrapper {
   def runJobs[T, U:ClassTag](
       sc: SparkContext,
       rdds: Seq[RDD[T]],
-      funcs: Seq[Iterator[T] => U]): Seq[Array[U]] = {
-    // TODO(shivaram): Add a flag to disable drizzle ?
-    sc.runJobs(rdds, funcs)
+      funcs: Seq[Iterator[T] => U],
+      useDrizzle: Boolean): Seq[Array[U]] = {
+    if (useDrizzle) {
+      sc.runJobs(rdds, funcs)
+    } else {
+      rdds.zip(funcs).map { case (rdd, func) =>
+        sc.runJob(rdd, func)
+      }
+    }
   }
 
 }
