@@ -28,7 +28,7 @@ object JobRunnerWrapper {
       rdds: Seq[RDD[T]],
       funcs: Seq[Iterator[T] => U],
       useDrizzle: Boolean): Seq[Array[U]] = {
-    if (useDrizzle) {
+    if (useDrizzle && rdds.size > 1) {
       sc.runJobs(rdds, funcs)
     } else {
       rdds.zip(funcs).map { case (rdd, func) =>
