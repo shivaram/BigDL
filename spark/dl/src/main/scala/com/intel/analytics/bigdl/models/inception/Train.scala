@@ -33,7 +33,15 @@ object TrainInceptionV1 {
       val imageSize = 224
       val conf = Engine.createSparkConf().setAppName("BigDL Inception v1 Train Example")
         .set("spark.task.maxFailures", "1")
+        .set("spark.executor.drizzle.barrierAcrossBatches", "true")
       val sc = new SparkContext(conf)
+      sc.hadoopConfiguration.set("fs.s3n.impl","org.apache.hadoop.fs.s3native.NativeS3FileSystem")
+      sc.hadoopConfiguration.set("fs.s3n.awsAccessKeyId", System.getenv("AWS_ACCESS_KEY_ID"))
+      sc.hadoopConfiguration.set("fs.s3n.awsSecretAccessKey", System.getenv("AWS_SECRET_ACCESS_KEY"))
+      sc.hadoopConfiguration.set("dfs.blocksize", "134217728")
+      sc.hadoopConfiguration.set("dfs.block.size", "134217728")
+      sc.hadoopConfiguration.set("fs.s3n.block.size", "1073741824")
+
       Engine.init(param.nodeNum, param.corePerTask, true)
 
       Engine.setPartitionNumber(Some(param.partitionNum))
@@ -74,7 +82,10 @@ object TrainInceptionV1 {
           "momentum" -> 0.9,
           "dampening" -> 0.0,
           "learingRateSchedule" -> SGD.Poly(0.5, math.ceil(1281167.toDouble / param.batchSize).toInt
-            * param.maxEpoch.get))
+            * param.maxEpoch.get),
+          "useDrizzle" -> param.useDrizzle,
+          "drizzleGroupSize" -> param.drizzleGroupSize
+         )
 //          "learingRateSchedule" -> SGD.Poly(0.5, math.ceil(1281167.toDouble / 1704).toInt
 //            * param.maxEpoch.get))
       } else {
@@ -83,7 +94,9 @@ object TrainInceptionV1 {
           "weightDecay" -> param.weightDecay,
           "momentum" -> 0.9,
           "dampening" -> 0.0,
-          "learningRateSchedule" -> SGD.Poly(0.5, param.maxIteration)
+          "learningRateSchedule" -> SGD.Poly(0.5, param.maxIteration),
+          "useDrizzle" -> param.useDrizzle,
+          "drizzleGroupSize" -> param.drizzleGroupSize
         )
       }
 

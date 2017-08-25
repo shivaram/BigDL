@@ -34,13 +34,17 @@ object Utils {
     checkpoint: Option[String] = None,
     modelSnapshot: Option[String] = None,
     stateSnapshot: Option[String] = None,
+    seed: Option[Long] = None,
     batchSize: Int = 12,
     learningRate: Double = 0.05,
     learningRateDecay: Double = 0.0,
     maxEpoch: Int = 15,
     coreNumber: Int = -1,
     nodeNumber: Int = -1,
-    overWriteCheckpoint: Boolean = false
+    overWriteCheckpoint: Boolean = false,
+    partitionNum: Int = -1,
+    drizzleGroupSize: Int = 1,
+    useDrizzle: Boolean = false
   )
 
   val trainParser = new OptionParser[TrainParams]("BigDL Lenet Train Example") {
@@ -53,6 +57,9 @@ object Utils {
     opt[String]("model")
       .text("model snapshot location")
       .action((x, c) => c.copy(modelSnapshot = Some(x)))
+    opt[Long]("seed")
+      .text("seed for random number generators")
+      .action((x, c) => c.copy(seed = Some(x)))
     opt[String]("state")
       .text("state snapshot location")
       .action((x, c) => c.copy(stateSnapshot = Some(x)))
@@ -74,6 +81,24 @@ object Utils {
     opt[Unit]("overWrite")
       .text("overwrite checkpoint files")
       .action( (_, c) => c.copy(overWriteCheckpoint = true) )
+    opt[Int]("drizzleGroupSize")
+      .text("drizzle group size")
+      .action((x, c) => c.copy(drizzleGroupSize = x))
+    opt[Boolean]("useDrizzle")
+      .text("whether drizzle should be used")
+      .action((x, c) => c.copy(useDrizzle = x))
+    opt[Int]("coreNumber")
+      .text("core number")
+      .action((x, c) => c.copy(coreNumber = x))
+      .required()
+    opt[Int]("nodeNumber")
+      .text("node number")
+      .action((x, c) => c.copy(nodeNumber = x))
+      .required()
+    opt[Int]("partitionNum")
+      .text("partition number")
+      .action((x, c) => c.copy(partitionNum = x))
+      .required()
   }
 
   case class TestParams(
