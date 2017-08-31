@@ -38,6 +38,7 @@ import scala.collection.mutable
 import scala.collection.mutable.ArrayBuffer
 import scala.concurrent.Future
 import scala.reflect.ClassTag
+import scala.reflect._
 
 object DistriOptimizer {
   import Optimizer._
@@ -84,6 +85,7 @@ object DistriOptimizer {
     val start = System.nanoTime()
     val cached = modelIter.next()
     val executorId = SparkEnv.get.executorId
+    val partitionId = TaskContext.get.partitionId()
     val parameters = ParameterManager2.get(executorId)
     val syWStart = System.nanoTime()
     ParameterManager2.synchronized {
@@ -272,13 +274,16 @@ object DistriOptimizer {
     var dataRDD = dataset.data(train = true)
     val dummyPartitioner = new HashPartitioner(Engine.nodeNumber())
 
+    var nextDrizzleGroupSize = drizzleGroupSize
+    var evalSinceLastEpoch = 1
+
     while (!endWhen(driverState)) {
       val _header = header(driverState[Int]("epoch"), accumulateCount, dataset.size(),
         driverState[Int]("neval"), wallClockTime)
 
       // All of these are accumulators
-      val lossSum = sc.accumulator(0.0, "loss sum")
-      val recordsNum = sc.accumulator(0, "record number")
+      // val lossSum = sc.accumulator(0.0, "loss sum")
+      // val recordsNum = sc.accumulator(0, "record number")
       metrics.set("computing time average", 0.0, sc, partitionNum)
       metrics.set("aggregate gradient time", 0.0, sc, partitionNum)
       metrics.set("get weights average", 0.0, sc, partitionNum)
@@ -293,7 +298,7 @@ object DistriOptimizer {
       val start = System.nanoTime()
 
       // Build up the drizzle RDDs
-      val drizzleRDDs = (0 until drizzleGroupSize).map { dIter =>
+      val drizzleRDDs = (0 until nextDrizzleGroupSize).map { dIter =>
         val curIter = iteration + dIter
         val finishedModels = models.zipPartitions(dataRDD, true)((modelIter, data) => {
             runTrainingOnExecutor(data, modelIter, driverMetrics, _subModelNumber, dropPercentage,
@@ -334,7 +339,7 @@ object DistriOptimizer {
         }.partitionBy(dummyPartitioner).values
 
         val aggregatedModels = putGradients.mapPartitions { iter =>
-          if (iter.hasNext) {
+          val outIter = if (iter.hasNext) {
             val (finishedModelNum, lossSum, recordNumSum) = iter.next()
             dropModelNumBatch += (driverSubModelNum - finishedModelNum)
             if (dropPercentage == 0 || finishedModelNum >= driverSubModelNum * (1-maxDropPercentage)) {
@@ -363,16 +368,22 @@ object DistriOptimizer {
               time = System.nanoTime()
               parameters.sendWeightExecutor()
               driverMetrics.add("send weights average", System.nanoTime() - time)
-              Iterator.single((recordNumSum, lossSum, finishedModelNum, true))
+
+              (0 until Engine.nodeNumber()).map { p =>
+                (p, (recordNumSum, lossSum, finishedModelNum, true))
+              }.iterator
             } else {
               logger.info(s"Warning!!! Ignore this iteration as more than maxDropPercentage " +
                 s"module is dropped!! Finished modules number: ${finishedModelNum}")
-              Iterator.single((recordNumSum, lossSum, finishedModelNum, false))
+              (0 until Engine.nodeNumber()).map { p =>
+                (p, (recordNumSum, lossSum, finishedModelNum, false))
+              }.iterator
             }
           } else {
             Iterator.empty
           }
-        }
+          outIter
+        }.partitionBy(dummyPartitioner).values
         aggregatedModels
       }
 
@@ -383,7 +394,7 @@ object DistriOptimizer {
           (-1, 0.0, 0, false)
         }
       }
-      val collectFuncs = Array.fill(drizzleGroupSize)(collectFunc)
+      val collectFuncs = Array.fill(nextDrizzleGroupSize)(collectFunc)
 
       val allResults = JobRunnerWrapper.runJobs(sc, drizzleRDDs, collectFuncs, useDrizzle)
 
@@ -397,21 +408,28 @@ object DistriOptimizer {
       val notIterationIgnored = drizzleIterationResults.last._4 // Note this should be the same on all tasks
 
       if (notIterationIgnored) {
-        accumulateCount += recordsNumFinished
         val end = System.nanoTime()
+
+        accumulateCount += recordsNumFinished
+        driverState("neval") = driverState[Int]("neval") + nextDrizzleGroupSize
+        evalSinceLastEpoch += nextDrizzleGroupSize
+        iteration += nextDrizzleGroupSize
+
         wallClockTime += end - start
+
         // optimMethod.updateHyperParameter(state, driverState)
         driverState("Loss") = lossSumFinished.toFloat / finishedModelNum
         driverState("Throughput") = recordsNumFinished.toFloat / ((end - start) / 1e9f)
         // if (state.contains("clr")) driverState("LearningRate") = -state[Double]("clr").toFloat
-        logger.info(s"Iteration ${driverState[Int]("neval")} took ${(end-start) / 1e9} seconds")
+
+        logger.info(s"Iteration ${driverState[Int]("neval")}, records ${recordsNumFinished} took ${(end-start) / 1e9} seconds")
         // logger.info(s"${_header} Train ${recordsNum.value} in ${(end - start) / 1e9}seconds. " +
         //  s"Throughput is ${driverState("Throughput")} records/second. ")
-        // logger.info(s"Loss is ${ driverState("Loss")}. ${optimMethod.getHyperParameter(state)}")
+        logger.info(s"Loss is ${driverState("Loss")}, Throughput is ${driverState("Throughput")} rec/s")
+
         // logger.info("\n" + metrics.summary())
 
         // compute threshold
-        iteration += drizzleGroupSize
         if (dropPercentage > 0 && iteration > warmupIterationNum &&
           iteration % computeThresholdbatchSize == 0) {
           val moduleTimeList = models.mapPartitions { iter =>
@@ -440,18 +458,35 @@ object DistriOptimizer {
           dropModelNumBatch = 0
         }
 
-        driverState("neval") = driverState[Int]("neval") + drizzleGroupSize
+        // if we are close to end of epoch change the nextDrizzleGroupSize to just be over the epoch boundary
+        var avgRecordNum = accumulateCount / evalSinceLastEpoch
+	if (accumulateCount < dataset.size()) {
+	  if (accumulateCount + (avgRecordNum * drizzleGroupSize) >= dataset.size()) {
+	    nextDrizzleGroupSize = math.floor((dataset.size() - accumulateCount).toDouble/avgRecordNum.toDouble).toInt
+	    if (nextDrizzleGroupSize == 0) {
+	      nextDrizzleGroupSize = 1
+	    }
+	    logger.info("Changing group size to " + nextDrizzleGroupSize +
+                        " avgRecordNum " + avgRecordNum + " accumulateCount " + accumulateCount)
+	  } else {
+	    nextDrizzleGroupSize = drizzleGroupSize
+	  }
+        } else {
+	  nextDrizzleGroupSize = drizzleGroupSize
+        }
+
         if (accumulateCount >= dataset.size()) {
           val epochEnd = System.nanoTime()
           wallClockTime = lastEpochTime + epochEnd - epochStart
           lastEpochTime = wallClockTime
           epochStart = System.nanoTime()
-          logger.info(s"${_header} Epoch finished. Wall clock time is ${wallClockTime / 1e6}ms")
+          logger.info(s"${accumulateCount}/${dataset.size()} Epoch finished. Wall clock time is ${wallClockTime / 1e6}ms")
 
           driverState("epoch") = driverState[Int]("epoch") + 1
           dataset.shuffle()
           dataRDD = dataset.data(train = true)
           accumulateCount = 0
+          evalSinceLastEpoch = 1
         }
         validate(
           validationTrigger,
