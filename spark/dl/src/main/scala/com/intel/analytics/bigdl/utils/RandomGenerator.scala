@@ -20,8 +20,22 @@ import java.io.{BufferedInputStream, FileInputStream}
 import java.nio.ByteBuffer
 import java.nio.file.{Files, Paths}
 
+import java.util.concurrent.ConcurrentHashMap
+
 object RandomGenerator {
   val generators = new ThreadLocal[RandomGenerator]()
+
+  val partitionLocalGenerators = new ConcurrentHashMap[Int, RandomGenerator]()
+
+  def partRNG(partId: Int, seed: Option[Long] = None): RandomGenerator = {
+    val ret = partitionLocalGenerators.putIfAbsent(partId, 
+        if (seed.isDefined) new RandomGenerator(seed.get) else new RandomGenerator())
+    if (ret == null) {
+      partitionLocalGenerators.get(partId)
+    } else {
+      ret
+    }
+  }
 
   // scalastyle:off methodName
   def RNG: RandomGenerator = {
@@ -33,10 +47,14 @@ object RandomGenerator {
   // scalastyle:on methodName
 
   def shuffle[T](data: Array[T]): Array[T] = {
+    shuffle(data, RNG)
+  }
+
+  def shuffle[T](data: Array[T], rngToUse: RandomGenerator): Array[T] = {
     var i = 0
     val length = data.length
     while (i < length) {
-      val exchange = RNG.uniform(0, length - i).toInt + i
+      val exchange = rngToUse.uniform(0, length - i).toInt + i
       val tmp = data(exchange)
       data(exchange) = data(i)
       data(i) = tmp

@@ -113,9 +113,9 @@ object DistriOptimizerPerf {
     rdd.count()
     val dummyDataSet = new DistributedDataSet[MiniBatch[Float]] {
       override def size(): Long = 10000
-      override def shuffle(): Unit = {}
+      override def shuffle(seed: Option[Long] = None): Unit = {}
       override def originRDD(): RDD[_] = rdd
-      override def data(train: Boolean): RDD[MiniBatch[Float]] = rdd
+      override def data(train: Boolean, seed: Option[Long] = None): RDD[MiniBatch[Float]] = rdd
     }
 
     val optimizer = Optimizer(

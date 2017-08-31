@@ -185,9 +185,9 @@ class OptimizerSpec extends FlatSpec with Matchers with BeforeAndAfter {
   "A Distributed dataset" should "spawn a distributed optimizer" in {
     val ds = new DistributedDataSet[Float] {
       override def originRDD(): RDD[_] = null
-      override def data(train: Boolean): RDD[Float] = null
+      override def data(train: Boolean, seed: Option[Long] = None): RDD[Float] = null
       override def size(): Long = 0
-      override def shuffle(): Unit = {}
+      override def shuffle(seed: Option[Long] = None): Unit = {}
     }
 
     val model = Linear[Float](4, 3)
@@ -199,9 +199,9 @@ class OptimizerSpec extends FlatSpec with Matchers with BeforeAndAfter {
 
   "A Local dataset" should "spawn a local optimizer" in {
     val ds = new LocalDataSet[Float] {
-      override def data(train: Boolean): Iterator[Float] = null
+      override def data(train: Boolean, seed: Option[Long] = None): Iterator[Float] = null
       override def size(): Long = 0
-      override def shuffle(): Unit = {}
+      override def shuffle(seed: Option[Long] = None): Unit = {}
     }
 
     val model = Linear[Float](4, 3)

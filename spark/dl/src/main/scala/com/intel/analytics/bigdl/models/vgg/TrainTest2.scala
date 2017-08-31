@@ -83,12 +83,12 @@ val rdd = sc.get.parallelize(1 to 256 * 4,
       val dataSet = new DistributedDataSet[MiniBatch[Double]] {
         override def originRDD(): RDD[_] = rdd
 
-        override def data(train : Boolean): RDD[MiniBatch[Double]] = rdd
+        override def data(train : Boolean, seed: Option[Long] = None): RDD[MiniBatch[Double]] = rdd
 
 //        override def size(): Long = 256 * param.nodeNumber
 override def size(): Long = 256 * 4
 
-        override def shuffle(): Unit = {}
+        override def shuffle(seed: Option[Long] = None): Unit = {}
       }
 
       def mse: Module[Double] = {

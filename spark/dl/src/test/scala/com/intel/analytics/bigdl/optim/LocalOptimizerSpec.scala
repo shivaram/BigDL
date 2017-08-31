@@ -77,9 +77,9 @@ object DummyDataSet extends LocalDataSet[MiniBatch[Float]] {
 
   override def size(): Long = totalSize
 
-  override def shuffle(): Unit = {}
+  override def shuffle(seed: Option[Long] = None): Unit = {}
 
-  override def data(train : Boolean): Iterator[MiniBatch[Float]] = {
+  override def data(train : Boolean, seed: Option[Long] = None): Iterator[MiniBatch[Float]] = {
     new Iterator[MiniBatch[Float]] {
       var i = 0
 

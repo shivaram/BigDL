@@ -120,11 +120,11 @@ class DistriOptimizerSpec extends FlatSpec with Matchers with BeforeAndAfter {
     dataSet = new DistributedDataSet[MiniBatch[Double]] {
       override def originRDD(): RDD[_] = rdd
 
-      override def data(train : Boolean): RDD[MiniBatch[Double]] = rdd
+      override def data(train : Boolean, seed: Option[Long] = None): RDD[MiniBatch[Double]] = rdd
 
       override def size(): Long = 256 * nodeNumber
 
-      override def shuffle(): Unit = {}
+      override def shuffle(seed: Option[Long] = None): Unit = {}
     }
 
     plusOne = 0.0
@@ -269,11 +269,11 @@ class DistriOptimizerSpec extends FlatSpec with Matchers with BeforeAndAfter {
     val dataSet = new DistributedDataSet[MiniBatch[Double]] {
       override def originRDD(): RDD[_] = rdd
 
-      override def data(train : Boolean): RDD[MiniBatch[Double]] = rdd
+      override def data(train : Boolean, seed: Option[Long] = None): RDD[MiniBatch[Double]] = rdd
 
       override def size(): Long = 256 * nodeNumber
 
-      override def shuffle(): Unit = {}
+      override def shuffle(seed: Option[Long] = None): Unit = {}
     }
     val optimizer = new DistriOptimizer[Double](mm, dataSet, new MSECriterion[Double]())
       .setState(T("learningRate" -> 20.0))

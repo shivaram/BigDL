@@ -85,7 +85,7 @@ object LocalOptimizerPerf {
     val criterion = ClassNLLCriterion()
     val labels = Tensor(param.batchSize).fill(1)
     val dummyDataSet = new LocalDataSet[MiniBatch[Float]] {
-      override def data(train : Boolean): Iterator[MiniBatch[Float]] = {
+      override def data(train : Boolean, seed: Option[Long] = None): Iterator[MiniBatch[Float]] = {
         new Iterator[MiniBatch[Float]] {
           override def hasNext: Boolean = true
 
@@ -95,7 +95,7 @@ object LocalOptimizerPerf {
         }
       }
       override def size(): Long = 100000
-      override def shuffle(): Unit = {}
+      override def shuffle(seed: Option[Long] = None): Unit = {}
     }
 
     Engine.setCoreNumber(param.coreNumber)

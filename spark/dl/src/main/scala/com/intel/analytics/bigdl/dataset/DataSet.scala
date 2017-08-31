@@ -25,6 +25,8 @@ import com.intel.analytics.bigdl.utils.{Engine, RandomGenerator}
 import org.apache.hadoop.io.Text
 import org.apache.log4j.Logger
 import org.apache.spark.SparkContext
+import org.apache.spark.TaskContext
+import org.apache.spark.HashPartitioner
 import org.apache.spark.rdd.RDD
 
 import scala.reflect._
@@ -51,12 +53,12 @@ trait AbstractDataSet[D, DataSequence] {
    *              sequence, or it has a limited length.
    * @return data sequence
    */
-  def data(train: Boolean): DataSequence
+  def data(train: Boolean, seed: Option[Long] = None): DataSequence
 
   /**
    * Change the order of the data sequence from the data set
    */
-  def shuffle(): Unit
+  def shuffle(seed: Option[Long] = None): Unit
 
   /**
    * Total size of the data set
@@ -111,11 +113,13 @@ trait LocalDataSet[T] extends AbstractDataSet[T, Iterator[T]] {
   override def transform[C: ClassTag](transformer: Transformer[T, C]): DataSet[C] = {
     val preDataSet = this
     new LocalDataSet[C] {
-      override def shuffle(): Unit = preDataSet.shuffle
+      override def shuffle(seed: Option[Long] = None): Unit = preDataSet.shuffle(seed)
 
       override def size(): Long = preDataSet.size()
 
-      override def data(train: Boolean): Iterator[C] = transformer(preDataSet.data(train))
+      override def data(train: Boolean, seed: Option[Long] = None): Iterator[C] = {
+        transformer(preDataSet.data(train, seed))
+      }
     }
   }
 }
@@ -125,11 +129,16 @@ trait LocalDataSet[T] extends AbstractDataSet[T, Iterator[T]] {
  * @tparam T
  */
 class LocalArrayDataSet[T] private[dataset](buffer: Array[T]) extends LocalDataSet[T] {
-  override def shuffle(): Unit = {
-    RandomGenerator.shuffle(buffer)
+  override def shuffle(seed: Option[Long] = None): Unit = {
+    val rngToUse = if (seed.isDefined) {
+        RandomGenerator.RNG.setSeed(seed.get)
+     } else {
+        RandomGenerator.RNG
+     }
+    RandomGenerator.shuffle(buffer, rngToUse)
   }
 
-  override def data(train: Boolean): Iterator[T] = {
+  override def data(train: Boolean, seed: Option[Long] = None): Iterator[T] = {
     new Iterator[T] {
       private val index = new AtomicInteger()
 
@@ -176,9 +185,9 @@ trait DistributedDataSet[T] extends AbstractDataSet[T, RDD[T]] {
     new DistributedDataSet[C] {
       override def size(): Long = preDataSet.size()
 
-      override def shuffle(): Unit = preDataSet.shuffle()
+      override def shuffle(seed: Option[Long] = None): Unit = preDataSet.shuffle(seed)
 
-      override def data(train: Boolean): RDD[C] =
+      override def data(train: Boolean, seed: Option[Long] = None): RDD[C] =
         preDataSet.data(train).zipPartitions(cachedTransformer)(
           (data, tran) => tran.next()(data))
 
@@ -213,13 +222,15 @@ class CachedDistriDataSet[T: ClassTag] private[dataset] (buffer: RDD[Array[T]])
     Iterator.single(RandomGenerator.shuffle((0 until iter.next().length).toArray))
   }).setName("shuffled index").cache()
 
-  override def data(train: Boolean): RDD[T] = {
+  override def data(train: Boolean, seed: Option[Long] = None): RDD[T] = {
     val _train = train
     buffer.zipPartitions(indexes)((dataIter, indexIter) => {
       val indexes = indexIter.next()
       val localData = dataIter.next()
       val offset = if (_train) {
-        RandomGenerator.RNG.uniform(0, localData.length).toInt
+        val startOff = RandomGenerator.partRNG(TaskContext.getPartitionId(), seed).uniform(
+            0, localData.length).toInt
+        startOff
       } else {
         0
       }
@@ -248,11 +259,12 @@ class CachedDistriDataSet[T: ClassTag] private[dataset] (buffer: RDD[Array[T]])
 
   override def size(): Long = count
 
-  override def shuffle(): Unit = {
+  override def shuffle(seed: Option[Long] = None): Unit = {
     indexes.unpersist()
-    indexes = buffer.mapPartitions(iter => {
-      Iterator.single(RandomGenerator.shuffle((0 until iter.next().length).toArray))
-    }).setName("shuffled index").cache()
+    indexes = buffer.mapPartitionsWithIndex { case (idx, iter) =>
+      val rngToUse = RandomGenerator.partRNG(idx, seed)
+      Iterator.single(RandomGenerator.shuffle((0 until iter.next().length).toArray, rngToUse))
+    }.setName("shuffled index").cache()
   }
 
   override def originRDD(): RDD[_] = buffer
@@ -283,9 +295,13 @@ object DataSet {
     val coreNumber = Engine.coreNumber()
 //      sc.parallelize(localData, nodeNumber * coreNumber)
     val rdd = sc.parallelize(localData, Engine.partitionNumber().get)
+	.zipWithUniqueId()
+        .map(x => (x._2, x._1))
         // Keep this line, or the array will be send to worker every time
         // .coalesce(nodeNumber, true)
-        .coalesce(Engine.partitionNumber().get, true)
+        // .coalesce(Engine.partitionNumber().get, true)
+        .partitionBy(new HashPartitioner(Engine.partitionNumber().get))
+        .map(x => x._2)
         .mapPartitions(iter => {
           Iterator.single(iter.toArray)
         }).setName("cached dataset")
@@ -295,6 +311,7 @@ object DataSet {
     logger.info("array RDD count after checkpoint " + c)
     val depsRDDs = rdd.dependencies.map(x => x.rdd)
     logger.info("DEP RDD is " + depsRDDs.mkString(","))
+    logger.info("Num elems per partition is " + rdd.map(x => x.length).collect().mkString(","))
     new CachedDistriDataSet[T](rdd)
   }
 
@@ -306,14 +323,18 @@ object DataSet {
    */
   def rdd[T: ClassTag](data: RDD[T]): DistributedDataSet[T] = {
     val nodeNumber = Engine.nodeNumber()
-    new CachedDistriDataSet[T](
-//      data.coalesce(nodeNumber, true)
-      data.coalesce(Engine.partitionNumber().get, true)
+
+    val rdd = data.coalesce(Engine.partitionNumber().get, true)
         .mapPartitions(iter => {
           Iterator.single(iter.toArray)
         }).setName("cached dataset")
         .cache()
-    )
+    rdd.localCheckpoint()
+    val c = rdd.count()
+    logger.info("array RDD count after checkpoint " + c)
+    val depsRDDs = rdd.dependencies.map(x => x.rdd)
+    logger.info("DEP RDD is " + depsRDDs.mkString(","))
+    new CachedDistriDataSet[T](rdd)
   }
 
   /**
